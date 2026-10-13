@@ -100,6 +100,15 @@ class Runner:
         # 판정 파일은 테스트가 끝날 때만 바뀌어요. 바인드 마운트에서 파일 하나 여는 게 느려서
         # 화면을 그릴 때마다 27개를 다시 읽지 않고, 한 번 읽은 판정을 기억해 둬요.
         self.verdicts = {}
+        # 여러 개를 돌릴 땐 make -jN 하나로 한꺼번에 돌려요. 테스트마다 디스크 사본을 따로 써서 안 겹쳐요.
+        self.parallel = True
+        self.jobs = max(1, (os.cpu_count() or 2) // 2)
+        self.pending = set()
+        self.next_poll = 0
+        self.started = 0
+
+    def is_running(self, test):
+        return test == self.current or test in self.pending
 
     def status(self, test):
         if test in self.errors:
@@ -124,6 +133,7 @@ class Runner:
         LOGS.mkdir(parents=True, exist_ok=True)
         self.queue = list(tests)
         self.current = None
+        self.started = time.monotonic()
         self.phase = "build"
         self.log = LOGS / "run.log"
         self.output = self.log.open("w")
@@ -144,6 +154,7 @@ class Runner:
         self.process = None
         self.queue = []
         self.current = None
+        self.pending = set()
         if self.temp_dir:
             self.temp_dir.cleanup()
             self.temp_dir = None
@@ -152,21 +163,68 @@ class Runner:
             self.output = None
         self.message = message
 
+    def poll_results(self, force=False):
+        """병렬 실행 중에 새로 생긴 판정 파일을 1초에 한 번만 확인해요."""
+        if not force and time.monotonic() < self.next_poll:
+            return
+        self.next_poll = time.monotonic() + 1
+        for test in list(self.pending):
+            if (BUILD / (test + ".result")).exists():
+                verdict = result_of(test)
+                if verdict != "--":
+                    self.verdicts[test] = verdict
+                    self.pending.discard(test)
+        elapsed = int(time.monotonic() - self.started)
+        self.message = f"병렬 실행 중 (-j{self.jobs}) · 남은 {len(self.pending)}개 · {elapsed // 60}분 {elapsed % 60}초"
+
+    def start_batch(self):
+        tests, self.queue = self.queue, []
+        for test in tests:
+            self.errors.discard(test)
+            self.forget(test)
+        self.pending = set(tests)
+        self.phase = "batch"
+        jobs = min(self.jobs, len(tests))
+        limits = [510 if "/mlfqs/" in test else 90 for test in tests]
+        self.spawn(["make", f"-j{jobs}"] + [test + ".result" for test in tests], BUILD,
+                   sum(limits) // jobs + max(limits) + 60)
+        self.poll_results(force=True)
+
+    def finish_batch(self, code):
+        self.poll_results(force=True)
+        for test in self.pending:
+            self.errors.add(test)
+            self.output.write(f"\nERR {test} (판정 파일이 안 생겼어요)\n")
+        elapsed = int(time.monotonic() - self.started)
+        message = f"실행을 마쳤어요. 병렬로 {elapsed // 60}분 {elapsed % 60}초 걸렸어요."
+        if self.errors:
+            message += f" 실행 오류 {len(self.errors)}개는 로그를 확인하세요."
+        self.output.write(f"\n(make exit {code})\n")
+        self.finish(message)
+
     def tick(self):
         if not self.busy:
             return
         code = self.process.poll()
+        if self.phase == "batch":
+            self.poll_results()
         if code is None and time.monotonic() < self.deadline:
             return
         if code is None:
             stop_process(self.process)
-            if self.current:
-                self.errors.add(self.current)
-                self.forget(self.current)
+            for test in ([self.current] if self.current else []) + list(self.pending):
+                self.errors.add(test)
+                self.forget(test)
             self.finish("시간 제한을 넘었어요. 실행 로그를 확인하세요.")
             return
         if self.phase == "build" and code != 0:
             self.finish(f"빌드 실패 (종료 코드 {code}) · 실행 로그를 확인하세요.")
+            return
+        if self.phase == "batch":
+            self.finish_batch(code)
+            return
+        if self.phase == "build" and self.parallel and len(self.queue) > 1:
+            self.start_batch()
             return
         if self.current:
             verdict = self.verdicts[self.current] = result_of(self.current)
@@ -193,8 +251,8 @@ class Runner:
     def cancel(self):
         if self.busy:
             stop_process(self.process)
-            if self.current:
-                self.forget(self.current)
+            for test in ([self.current] if self.current else []) + list(self.pending):
+                self.forget(test)
             self.finish("실행을 중단했어요. 중단된 테스트의 불완전한 결과는 지웠어요.")
 
 
@@ -273,6 +331,8 @@ def fit(text, columns):
 HELP = [
     "Enter/r  선택한 테스트 실행 (항상 빌드 후 재실행)",
     "g        현재 묶음 전체 실행    a  27개 전체 실행",
+    "p        여러 개 실행할 때 병렬(make -jN) / 하나씩 바꾸기. 처음엔 병렬",
+    "         병렬에서 mlfqs가 FAIL이면 그 테스트만 Enter로 하나씩 다시 확인해 보세요",
     "f        현재 묶음의 FAIL/ERR 재실행    s  실행 중단",
     "1/2/3/4  전체 / alarm / priority / mlfqs",
     "/        테스트 이름 검색 (Enter 완료, Esc 취소)",
@@ -374,7 +434,8 @@ class App:
         left = min(42, max(34, width // 3))
         rows = height - 7
         statuses = [self.runner.status(test) for test in self.tests]
-        self.put(0, 1, f"PintOS · Threads   마지막 결과: PASS {statuses.count('PASS')} / FAIL {statuses.count('FAIL')} / 오류 {statuses.count('ERR')} / 미실행 {statuses.count('--')}", curses.A_BOLD)
+        self.put(0, 1, f"PintOS · Threads   마지막 결과: PASS {statuses.count('PASS')} / FAIL {statuses.count('FAIL')} / 오류 {statuses.count('ERR')} / 미실행 {statuses.count('--')}"
+                 + (f"   병렬 ×{self.runner.jobs}" if self.runner.parallel else "   하나씩"), curses.A_BOLD)
         self.put(1, 1, f"묶음: {self.group}   검색: {self.query or '전체'}   ? 도움말", curses.color_pair(3))
         focused = curses.A_BOLD | curses.A_REVERSE
         self.put(2, 1, ("▶ " if self.focus == "tests" else "  ") + "테스트 / 마지막 판정",
@@ -386,7 +447,7 @@ class App:
         tests = self.visible()
         start = max(0, self.index - rows + 1)
         for row, test in enumerate(tests[start:start + rows], 3):
-            status = "RUN" if self.runner.current == test else self.runner.status(test)
+            status = "RUN" if self.runner.is_running(test) else self.runner.status(test)
             attr = curses.color_pair(1 if status == "PASS" else 2 if status in ("FAIL", "ERR") else 3)
             if test == self.selected():
                 attr |= curses.A_REVERSE
@@ -398,7 +459,7 @@ class App:
         self.put(height - 3, 1, self.runner.message, curses.color_pair(3))
         arrows = "↑↓ 테스트 선택  → 로그로" if self.focus == "tests" else "↑↓ 로그 스크롤  ← 테스트로"
         self.put(height - 2, 1, arrows + "  Enter 실행  g 묶음  f 실패  d 디버그  Tab 로그  s 중단  q 종료")
-        self.put(height - 1, 1, "1 전체  2 alarm  3 priority  4 mlfqs  / 검색  j/k 선택  [ ] 스크롤  "
+        self.put(height - 1, 1, "1 전체  2 alarm  3 priority  4 mlfqs  / 검색  j/k 선택  [ ] 스크롤  p 병렬  "
                  + ("m 마우스 끄기" if self.mouse else "m 마우스 켜기") + "  ? 도움말")
         self.screen.refresh()
 
@@ -492,6 +553,10 @@ class App:
                         self.scroll(-3)
                     elif state & WHEEL_DOWN:
                         self.scroll(3)
+                elif key == ord("p") and not self.runner.busy:
+                    self.runner.parallel = not self.runner.parallel
+                    self.runner.message = (f"여러 개를 돌릴 때 make -j{self.runner.jobs} 로 한꺼번에 돌려요."
+                                           if self.runner.parallel else "여러 개를 돌릴 때 하나씩 차례로 돌려요.")
                 elif key == ord("m"):
                     self.mouse = not self.mouse
                     self.set_mouse(self.mouse)

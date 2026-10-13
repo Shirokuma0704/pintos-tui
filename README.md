@@ -75,6 +75,8 @@ docker exec -it -e TERM=xterm-256color -e LANG=C.UTF-8 <컨테이너ID> python3 
 | / | 테스트 이름 검색 |
 | Tab | 판정 / QEMU 출력 / 오류 / 실행 로그 / 디버그 QEMU 로그 |
 | PgUp / PgDn, Home / End | 로그 스크롤 |
+| 마우스 휠 | 로그 3줄씩 스크롤 (↑↓는 그대로 테스트 고르기) |
+| m | 마우스 켜기/끄기. 켜 둔 동안 글자 복사는 Shift+드래그 |
 | d | 빌드하고 고른 테스트를 GDB로 디버깅 |
 | s | 실행 중단 |
 | ? | 도움말 |

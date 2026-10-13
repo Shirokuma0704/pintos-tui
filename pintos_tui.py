@@ -23,6 +23,9 @@ PROJECT = PINTOS / "threads"
 BUILD = PROJECT / "build"
 LOGS = ROOT / ".tui" / "logs"
 GROUPS = ("all", "alarm", "priority", "mlfqs")
+# 휠은 ncurses에서 4·5번 버튼 '눌림'으로 와요. 오래된 파이썬에는 5번 상수가 없어서 ncurses 6 값으로 채워요.
+WHEEL_UP = curses.BUTTON4_PRESSED
+WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0x200000)
 
 
 def discover_tests():
@@ -275,6 +278,8 @@ HELP = [
     "/        테스트 이름 검색 (Enter 완료, Esc 취소)",
     "Tab      판정 / QEMU 출력 / 오류 / 실행 로그 / 디버그 로그",
     "PgUp/Dn  오른쪽 로그 스크롤    Home/End  처음/끝",
+    "휠       오른쪽 로그 3줄씩 스크롤 (↑↓는 계속 테스트 선택)",
+    "m        마우스 켜기/끄기. 화면 글자를 드래그로 복사할 땐 끄거나 Shift+드래그",
     "d        선택한 테스트를 GDB TUI로 열기 (run_test에서 정지)",
     "GDB: b 함수명 | n 다음 줄 | s 함수 안으로 | c 계속",
     "GDB: p 변수명 | info locals 지역변수 | bt 호출 스택",
@@ -305,6 +310,24 @@ class App:
         curses.use_default_colors()
         for pair, color in ((1, curses.COLOR_GREEN), (2, curses.COLOR_RED), (3, curses.COLOR_CYAN)):
             curses.init_pair(pair, color, -1)
+        self.mouse = True
+        self.set_mouse(self.mouse)
+
+    def set_mouse(self, on):
+        """휠만 받아요. 켜 두면 터미널이 클릭을 가져가서, 글자 복사는 Shift+드래그나 m으로 끄고 해요."""
+        try:
+            curses.mouseinterval(0)
+            curses.mousemask(WHEEL_UP | WHEEL_DOWN if on else 0)
+        except curses.error:
+            pass
+
+    def scroll(self, delta):
+        """오른쪽 로그를 delta줄 움직여요. 맨 끝까지 내려가면 다시 끝을 따라가요."""
+        rows = max(1, self.screen.getmaxyx()[0] - 7)
+        maximum = max(0, len(self.log_lines()[1]) - rows)
+        position = maximum if self.offset is None else min(self.offset, maximum)
+        position = max(0, position + delta)
+        self.offset = None if position >= maximum and delta > 0 else position
 
     def visible(self):
         return [test for test in self.tests
@@ -366,7 +389,8 @@ class App:
             self.put(row, left + 2, line)
         self.put(height - 3, 1, self.runner.message, curses.color_pair(3))
         self.put(height - 2, 1, "↑↓ 선택  Enter 실행  g 묶음  f 실패  d 디버그  Tab 로그  s 중단  q 종료")
-        self.put(height - 1, 1, "1 전체  2 alarm  3 priority  4 mlfqs  / 검색  PgUp/Dn 스크롤  ? 도움말")
+        self.put(height - 1, 1, "1 전체  2 alarm  3 priority  4 mlfqs  / 검색  PgUp/Dn·휠 스크롤  "
+                 + ("m 마우스 끄기" if self.mouse else "m 마우스 켜기") + "  ? 도움말")
         self.screen.refresh()
 
     def search(self):
@@ -408,6 +432,7 @@ class App:
             curses.reset_prog_mode()
             self.screen.clear()
             self.screen.timeout(100)
+            self.set_mouse(self.mouse)
         self.runner.message = "디버깅을 마쳤어요. Tab으로 디버그 QEMU 로그를 볼 수 있어요."
         self.view = 4
         self.offset = None
@@ -442,9 +467,21 @@ class App:
                     self.help, self.offset = not self.help, 0
                 elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
                     rows = max(1, self.screen.getmaxyx()[0] - 7)
-                    maximum = max(0, len(self.log_lines()[1]) - rows)
-                    position = maximum if self.offset is None else self.offset
-                    self.offset = max(0, position + (-rows if key == curses.KEY_PPAGE else rows))
+                    self.scroll(-rows if key == curses.KEY_PPAGE else rows)
+                elif key == curses.KEY_MOUSE:
+                    try:
+                        _, _, _, _, state = curses.getmouse()
+                    except curses.error:
+                        state = 0
+                    if state & WHEEL_UP:
+                        self.scroll(-3)
+                    elif state & WHEEL_DOWN:
+                        self.scroll(3)
+                elif key == ord("m"):
+                    self.mouse = not self.mouse
+                    self.set_mouse(self.mouse)
+                    self.runner.message = ("마우스 켰어요. 휠로 로그를 내려요. 복사는 Shift+드래그예요." if self.mouse
+                                           else "마우스 껐어요. 드래그로 글자를 복사할 수 있어요. 휠은 m으로 다시 켜요.")
                 elif key in (curses.KEY_HOME, curses.KEY_END):
                     self.offset = 0 if key == curses.KEY_HOME else None
                 elif key == ord("s"):

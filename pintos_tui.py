@@ -46,10 +46,16 @@ def environment(temp_dir=None):
 
 
 def read_lines(path):
-    try:
-        return path.read_text(errors="replace").splitlines()
-    except FileNotFoundError:
-        return []
+    """Windows 폴더를 바인드 마운트하면, 쓰는 중인 파일을 읽다가 ENODATA 같은 OSError가 가끔 나요.
+    잠깐 쉬고 몇 번 다시 읽어 보고, 그래도 안 되면 빈 내용으로 넘겨서 화면이 죽지 않게 해요."""
+    for attempt in range(3):
+        try:
+            return path.read_text(errors="replace").splitlines()
+        except FileNotFoundError:
+            return []
+        except OSError:
+            time.sleep(0.05 * (attempt + 1))
+    return []
 
 
 def result_of(test):

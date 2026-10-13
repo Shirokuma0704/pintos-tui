@@ -278,7 +278,10 @@ HELP = [
     "/        테스트 이름 검색 (Enter 완료, Esc 취소)",
     "Tab      판정 / QEMU 출력 / 오류 / 실행 로그 / 디버그 로그",
     "PgUp/Dn  오른쪽 로그 스크롤    Home/End  처음/끝",
-    "휠       오른쪽 로그 3줄씩 스크롤 (↑↓는 계속 테스트 선택)",
+    "→ / ←    ↑↓(와 휠)이 움직일 쪽을 로그 / 테스트 목록으로 바꾸기",
+    "         CLion 터미널은 휠을 ↑↓로 보내서, → 로 로그 쪽에 두면 휠로 로그가 내려가요",
+    "j/k      어느 쪽이든 테스트 선택    [ ]  어느 쪽이든 로그 3줄 스크롤",
+    "휠       마우스를 넘겨주는 터미널에서는 언제나 로그 스크롤",
     "m        마우스 켜기/끄기. 화면 글자를 드래그로 복사할 땐 끄거나 Shift+드래그",
     "d        선택한 테스트를 GDB TUI로 열기 (run_test에서 정지)",
     "GDB: b 함수명 | n 다음 줄 | s 함수 안으로 | c 계속",
@@ -303,6 +306,7 @@ class App:
         self.view = 0
         self.offset = None
         self.help = False
+        self.focus = "tests"        # ↑↓가 움직이는 쪽. "tests" 또는 "log"
         self.debug_pending = None
         self.screen.timeout(100)
         curses.curs_set(0)
@@ -372,9 +376,13 @@ class App:
         statuses = [self.runner.status(test) for test in self.tests]
         self.put(0, 1, f"PintOS · Threads   마지막 결과: PASS {statuses.count('PASS')} / FAIL {statuses.count('FAIL')} / 오류 {statuses.count('ERR')} / 미실행 {statuses.count('--')}", curses.A_BOLD)
         self.put(1, 1, f"묶음: {self.group}   검색: {self.query or '전체'}   ? 도움말", curses.color_pair(3))
-        self.put(2, 1, "테스트 / 마지막 판정", curses.A_BOLD, left - 1)
+        focused = curses.A_BOLD | curses.A_REVERSE
+        self.put(2, 1, ("▶ " if self.focus == "tests" else "  ") + "테스트 / 마지막 판정",
+                 focused if self.focus == "tests" else curses.A_BOLD, left - 1)
         label, lines = self.log_lines()
-        self.put(2, left + 2, label + (" · 끝을 따라가는 중" if self.offset is None else " · 스크롤 중"), curses.A_BOLD)
+        self.put(2, left + 2, ("▶ " if self.focus == "log" else "") + label
+                 + (" · 끝을 따라가는 중" if self.offset is None else " · 스크롤 중"),
+                 focused if self.focus == "log" else curses.A_BOLD)
         tests = self.visible()
         start = max(0, self.index - rows + 1)
         for row, test in enumerate(tests[start:start + rows], 3):
@@ -388,8 +396,9 @@ class App:
         for row, line in enumerate((lines or ["아직 출력이 없어요."])[offset:offset + rows], 3):
             self.put(row, left + 2, line)
         self.put(height - 3, 1, self.runner.message, curses.color_pair(3))
-        self.put(height - 2, 1, "↑↓ 선택  Enter 실행  g 묶음  f 실패  d 디버그  Tab 로그  s 중단  q 종료")
-        self.put(height - 1, 1, "1 전체  2 alarm  3 priority  4 mlfqs  / 검색  PgUp/Dn·휠 스크롤  "
+        arrows = "↑↓ 테스트 선택  → 로그로" if self.focus == "tests" else "↑↓ 로그 스크롤  ← 테스트로"
+        self.put(height - 2, 1, arrows + "  Enter 실행  g 묶음  f 실패  d 디버그  Tab 로그  s 중단  q 종료")
+        self.put(height - 1, 1, "1 전체  2 alarm  3 priority  4 mlfqs  / 검색  j/k 선택  [ ] 스크롤  "
                  + ("m 마우스 끄기" if self.mouse else "m 마우스 켜기") + "  ? 도움말")
         self.screen.refresh()
 
@@ -451,6 +460,12 @@ class App:
                     if not self.runner.busy:
                         return
                     self.runner.message = "실행 중이에요. s로 중단한 뒤 q로 나갈 수 있어요."
+                elif key in (curses.KEY_RIGHT, curses.KEY_LEFT):
+                    self.focus = "log" if key == curses.KEY_RIGHT else "tests"
+                elif key in (curses.KEY_UP, curses.KEY_DOWN) and self.focus == "log":
+                    self.scroll(-3 if key == curses.KEY_UP else 3)
+                elif key in (ord("["), ord("]")):
+                    self.scroll(-3 if key == ord("[") else 3)
                 elif key in (curses.KEY_UP, ord("k")):
                     self.index -= 1
                     self.offset = None
